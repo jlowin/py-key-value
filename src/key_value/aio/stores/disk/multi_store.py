@@ -1,3 +1,5 @@
+import sqlite3
+
 from collections.abc import Callable
 from datetime import timezone
 from pathlib import Path
@@ -7,23 +9,24 @@ from typing_extensions import override
 
 from key_value.aio.stores.base import BaseContextManagerStore, BaseStore
 from key_value.aio.stores.disk.store import (
-    _create_disk_cache,
-    _disk_cache_close,
-    _disk_cache_delete,
-    _disk_cache_get_with_expire,
-    _disk_cache_set,
+    _DB_FILENAME,
+    _create_connection,
+    _sqlite_close,
+    _sqlite_delete,
+    _sqlite_evict,
+    _sqlite_get_with_expire,
+    _sqlite_set,
 )
 from key_value.shared.managed_entry import ManagedEntry, datetime
 from key_value.shared.serialization import BasicSerializationAdapter
 
 try:
-    from diskcache import Cache
     from pathvalidate import sanitize_filename
 except ImportError as e:
-    msg = "DiskStore requires py-key-value-aio[disk]"
+    msg = "MultiDiskStore requires py-key-value-aio[disk]"
     raise ImportError(msg) from e
 
-CacheFactory = Callable[[str], Cache]
+ConnectionFactory = Callable[[str], sqlite3.Connection]
 
 
 def _sanitize_collection_for_filesystem(collection: str) -> str:
@@ -33,25 +36,26 @@ def _sanitize_collection_for_filesystem(collection: str) -> str:
 
 
 class MultiDiskStore(BaseContextManagerStore, BaseStore):
-    """A disk-based store that uses the diskcache library to store data. The MultiDiskStore by default creates
-    one diskcache Cache instance per collection created by the caller but a custom factory function can be provided
-    to tightly control the creation of the diskcache Cache instances."""
+    """A disk-based store that uses SQLite for persistent storage. The MultiDiskStore creates
+    one SQLite database per collection, each in its own subdirectory. A custom connection factory
+    can be provided to control the creation of SQLite connections."""
 
-    _cache: dict[str, Cache]
+    _conn: dict[str, sqlite3.Connection]
 
-    _disk_cache_factory: CacheFactory
+    _connection_factory: ConnectionFactory
 
     _base_directory: Path
+    _max_size: int | None
     _auto_create: bool
 
     @overload
-    def __init__(self, *, disk_cache_factory: CacheFactory, default_collection: str | None = None, auto_create: bool = True) -> None:
-        """Initialize a multi-disk store with a custom factory function. The function will be called for each
+    def __init__(self, *, connection_factory: ConnectionFactory, default_collection: str | None = None, auto_create: bool = True) -> None:
+        """Initialize a multi-disk store with a custom connection factory. The function will be called for each
         collection created by the caller with the collection name as the argument. Use this to tightly
-        control the creation of the diskcache Cache instances.
+        control the creation of the SQLite connections.
 
         Args:
-            disk_cache_factory: A factory function that creates a diskcache Cache instance for a given collection.
+            connection_factory: A factory function that creates a sqlite3 Connection for a given collection.
             default_collection: The default collection to use if no collection is provided.
             auto_create: Whether to automatically create directories if they don't exist. Defaults to True.
         """
@@ -60,11 +64,11 @@ class MultiDiskStore(BaseContextManagerStore, BaseStore):
     def __init__(
         self, *, base_directory: Path, max_size: int | None = None, default_collection: str | None = None, auto_create: bool = True
     ) -> None:
-        """Initialize a multi-disk store that creates one diskcache Cache instance per collection created by the caller.
+        """Initialize a multi-disk store that creates one SQLite database per collection.
 
         Args:
-            base_directory: The directory to use for the disk caches.
-            max_size: The maximum size of the disk caches.
+            base_directory: The directory to use for the databases.
+            max_size: The maximum approximate data size per collection in bytes before eviction occurs.
             default_collection: The default collection to use if no collection is provided.
             auto_create: Whether to automatically create directories if they don't exist. Defaults to True.
         """
@@ -72,24 +76,24 @@ class MultiDiskStore(BaseContextManagerStore, BaseStore):
     def __init__(
         self,
         *,
-        disk_cache_factory: CacheFactory | None = None,
+        connection_factory: ConnectionFactory | None = None,
         base_directory: Path | None = None,
         max_size: int | None = None,
         default_collection: str | None = None,
         auto_create: bool = True,
     ) -> None:
-        """Initialize the disk caches.
+        """Initialize the multi-disk store.
 
         Args:
-            disk_cache_factory: A factory function that creates a diskcache Cache instance for a given collection.
-            base_directory: The directory to use for the disk caches.
-            max_size: The maximum size of the disk caches.
+            connection_factory: A factory function that creates a sqlite3 Connection for a given collection.
+            base_directory: The directory to use for the databases.
+            max_size: The maximum approximate data size per collection in bytes before eviction occurs.
             default_collection: The default collection to use if no collection is provided.
             auto_create: Whether to automatically create directories if they don't exist. Defaults to True.
                 When False, raises ValueError if a directory doesn't exist.
         """
-        if disk_cache_factory is None and base_directory is None:
-            msg = "Either disk_cache_factory or base_directory must be provided"
+        if connection_factory is None and base_directory is None:
+            msg = "Either connection_factory or base_directory must be provided"
             raise ValueError(msg)
 
         if base_directory is None:
@@ -97,9 +101,10 @@ class MultiDiskStore(BaseContextManagerStore, BaseStore):
 
         self._base_directory = base_directory.resolve()
         self._auto_create = auto_create
+        self._max_size = max_size
 
-        def default_disk_cache_factory(collection: str) -> Cache:
-            """Create a default disk cache factory that creates a diskcache Cache instance for a given collection."""
+        def default_connection_factory(collection: str) -> sqlite3.Connection:
+            """Create a default connection factory that creates a SQLite database for a given collection."""
             sanitized_collection: str = _sanitize_collection_for_filesystem(collection=collection)
 
             cache_directory: Path = self._base_directory / sanitized_collection
@@ -110,11 +115,11 @@ class MultiDiskStore(BaseContextManagerStore, BaseStore):
                     raise ValueError(msg)
                 cache_directory.mkdir(parents=True, exist_ok=True)
 
-            return _create_disk_cache(directory=cache_directory, max_size=max_size)
+            return _create_connection(cache_directory / _DB_FILENAME)
 
-        self._disk_cache_factory = disk_cache_factory or default_disk_cache_factory
+        self._connection_factory = connection_factory or default_connection_factory
 
-        self._cache = {}
+        self._conn = {}
 
         self._serialization_adapter = BasicSerializationAdapter()
 
@@ -125,18 +130,18 @@ class MultiDiskStore(BaseContextManagerStore, BaseStore):
 
     @override
     async def _setup(self) -> None:
-        """Register cache cleanup."""
+        """Register connection cleanup."""
         self._exit_stack.callback(self._sync_close)
 
     @override
     async def _setup_collection(self, *, collection: str) -> None:
-        self._cache[collection] = self._disk_cache_factory(collection)
+        self._conn[collection] = self._connection_factory(collection)
 
     @override
     async def _get_managed_entry(self, *, key: str, collection: str) -> ManagedEntry | None:
         expire_epoch: float | None
 
-        managed_entry_str, expire_epoch = _disk_cache_get_with_expire(cache=self._cache[collection], key=key)
+        managed_entry_str, expire_epoch = _sqlite_get_with_expire(conn=self._conn[collection], key=key)
 
         if not isinstance(managed_entry_str, str):
             return None
@@ -156,20 +161,23 @@ class MultiDiskStore(BaseContextManagerStore, BaseStore):
         collection: str,
         managed_entry: ManagedEntry,
     ) -> None:
-        _ = _disk_cache_set(
-            cache=self._cache[collection],
+        _ = _sqlite_set(
+            conn=self._conn[collection],
             key=key,
             value=self._serialization_adapter.dump_json(entry=managed_entry, key=key, collection=collection),
             expire=managed_entry.ttl,
         )
 
+        if self._max_size is not None and self._max_size > 0:
+            _sqlite_evict(conn=self._conn[collection], max_size=self._max_size)
+
     @override
     async def _delete_managed_entry(self, *, key: str, collection: str) -> bool:
-        return _disk_cache_delete(cache=self._cache[collection], key=key)
+        return _sqlite_delete(conn=self._conn[collection], key=key)
 
     def _sync_close(self) -> None:
-        for cache in self._cache.values():
-            _disk_cache_close(cache=cache)
+        for conn in self._conn.values():
+            _sqlite_close(conn=conn)
 
     def __del__(self) -> None:
         self._sync_close()
